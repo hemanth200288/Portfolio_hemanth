@@ -24,6 +24,8 @@ dotenv.load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent))
 
 logger = logging.getLogger("avatar-example")
+SIMLI_START_RETRIES = 3
+SIMLI_RETRY_BACKOFF_SECONDS = 2
 
 
 @dataclass
@@ -65,7 +67,31 @@ class SimliVideoGenerator(VideoGenerator):
             self.config,
             # simliURL="http://127.0.0.1:8892",  # used for debugging on simli servers or to connect to a relay server
         )
-        await self._simli_client.start()
+        last_error: Exception | None = None
+        for attempt in range(1, SIMLI_START_RETRIES + 1):
+            try:
+                await self._simli_client.start()
+                break
+            except Exception as exc:
+                last_error = exc
+                if attempt == SIMLI_START_RETRIES:
+                    logger.error(
+                        "Simli start failed after %s attempts: %r",
+                        attempt,
+                        exc,
+                    )
+                    raise
+                logger.warning(
+                    "Simli start attempt %s/%s failed: %r; retrying in %ss",
+                    attempt,
+                    SIMLI_START_RETRIES,
+                    exc,
+                    SIMLI_RETRY_BACKOFF_SECONDS * attempt,
+                )
+                await asyncio.sleep(SIMLI_RETRY_BACKOFF_SECONDS * attempt)
+
+        if last_error and self._recv_audio_atask is None and self._recv_video_atask is None:
+            logger.info("Simli recovered after retry")
 
         self._recv_audio_atask = asyncio.create_task(self._recv_audio_task())
         self._recv_video_atask = asyncio.create_task(self._recv_video_task())
@@ -78,7 +104,9 @@ class SimliVideoGenerator(VideoGenerator):
             if self._input_resampler is not None:
                 for resampled_frame in self._input_resampler.flush():
                     await self._simli_client.send(bytes(resampled_frame.data))
-            # send the end of the audio segment sentinel if needed
+            # Propagate segment boundaries so AvatarRunner can emit playback-finished
+            # back to the agent session and return it to the listening state.
+            await self._data_ch.put(AudioSegmentEnd())
             return
 
         if not self._input_resampler and (

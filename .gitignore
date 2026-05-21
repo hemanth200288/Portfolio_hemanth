@@ -5,3 +5,7 @@ venv/
 .env.local
 .env
 .env.production
+node_modules/
+.next/
+out/
+dist/

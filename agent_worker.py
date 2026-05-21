@@ -1,9 +1,11 @@
+import asyncio
 import argparse
 import logging
 import os
 import sys
 from dataclasses import asdict, dataclass
 from functools import partial
+from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
@@ -23,6 +25,13 @@ load_dotenv()
 
 
 AVATAR_IDENTITY = "avatar_worker"
+THIS_DIR = Path(__file__).parent.resolve()
+PROMPT_PATH = THIS_DIR / "propmt.txt"
+DEFAULT_PROMPT = (
+    "You are Hemanth Kumar Chittiprolu's personal AI assistant. "
+    "Answer in first person on his behalf, stay concise, and keep responses professional."
+)
+DEFAULT_ELEVEN_VOICE_ID = "TX3LPaxmHKxFdv7VOQHJ"
 
 
 @dataclass
@@ -32,6 +41,13 @@ class AvatarConnectionInfo:
     """LiveKit server URL"""
     token: str
     """Token for avatar worker to join"""
+
+
+def load_agent_instructions() -> str:
+    if PROMPT_PATH.exists():
+        return PROMPT_PATH.read_text(encoding="utf-8").strip()
+    logger.warning("Prompt file %s not found, using fallback instructions", PROMPT_PATH)
+    return DEFAULT_PROMPT
 
 
 async def launch_avatar_worker(
@@ -69,24 +85,24 @@ def prewarm(proc: JobProcess):
 async def entrypoint(ctx: JobContext, avatar_dispatcher_url: str):
     await ctx.connect()
 
-    voice_id = "TX3LPaxmHKxFdv7VOQHJ"
+    voice_id = os.getenv("ELEVEN_VOICE_ID", DEFAULT_ELEVEN_VOICE_ID)
+    instructions = load_agent_instructions()
+    stop_event = asyncio.Event()
 
     agent = Agent(
-        instructions="You are a helpful assistant named Tasha. Your goal is to demonstrate your capabilities in a succinct way. Your output will be converted to audio so don't include special characters in your answers. Respond to what the user said in a creative and helpful way.",
-        # llm=openai.realtime.RealtimeModel(),
+        instructions=instructions,
+    )
 
+    session = AgentSession(
         vad=ctx.proc.userdata["vad"],
-        # any combination of STT, LLM, TTS, or realtime API can be used
         llm=openai.LLM(
             model="deepseek/deepseek-chat",
             base_url="https://openrouter.ai/api/v1",
-            api_key=os.getenv("OPENROUTER_API_KEY")
+            api_key=os.getenv("OPENROUTER_API_KEY"),
         ),
         stt=deepgram.STT(model="nova-3"),
         tts=elevenlabs.TTS(voice_id=voice_id, api_key=os.getenv("ELEVEN_API_KEY")),
     )
-
-    session = AgentSession()
 
     # wait for the participant to join the room and the avatar worker to connect
     await launch_avatar_worker(ctx, avatar_dispatcher_url, AVATAR_IDENTITY)
@@ -110,6 +126,44 @@ async def entrypoint(ctx: JobContext, avatar_dispatcher_url: str):
                 "interrupted": ev.interrupted,
             },
         )
+
+    @session.on("user_input_transcribed")
+    def on_user_input_transcribed(event) -> None:
+        logger.info(
+            "user_input_transcribed",
+            extra={
+                "transcript": event.transcript,
+                "is_final": event.is_final,
+                "language": event.language,
+            },
+        )
+
+    @session.on("agent_state_changed")
+    def on_agent_state_changed(event) -> None:
+        logger.info("agent_state_changed", extra={"state": event.new_state})
+
+    @session.on("conversation_item_added")
+    def on_conversation_item_added(event) -> None:
+        logger.info(
+            "conversation_item_added",
+            extra={
+                "role": getattr(event.item, "role", None),
+                "text": getattr(event.item, "text_content", None),
+            },
+        )
+
+    def on_participant_disconnected(participant: rtc.RemoteParticipant) -> None:
+        if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD:
+            logger.info("Client participant disconnected, closing session")
+            stop_event.set()
+
+    ctx.room.on("participant_disconnected", on_participant_disconnected)
+    ctx.room.on("disconnected", lambda *_: stop_event.set())
+
+    try:
+        await stop_event.wait()
+    finally:
+        await session.aclose()
 
 
 if __name__ == "__main__":

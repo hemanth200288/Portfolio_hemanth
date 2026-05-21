@@ -18,3 +18,4 @@ uvicorn
 httpx
 
 aiortc>=1.11.0 # fixes video/rtx codec issue
+pytest>=8,<9
